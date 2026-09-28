@@ -178,12 +178,15 @@ fn register_validator_with_key(
 #[test]
 fn submit_attested_milestone_is_closed_once_threshold_mode_is_configured() {
     let (env, client, _admin, contract_id) = setup();
-    client.set_milestone_threshold(&2u32);
 
     let validator = Address::generate(&env);
     let relayer = Address::generate(&env);
     let sk = signing_key(1);
     register_validator_with_key(&env, &client, &validator, &sk);
+    let extra = Address::generate(&env);
+    let sk2 = signing_key(2);
+    register_validator_with_key(&env, &client, &extra, &sk2);
+    client.set_milestone_threshold(&2u32);
 
     let attestation = MilestoneAttestation {
         validator_wallet: validator.clone(),
@@ -233,9 +236,11 @@ fn submit_attested_milestone_is_closed_once_threshold_mode_is_configured() {
 #[test]
 fn has_attested_returns_false_once_window_has_expired_even_before_the_next_vote_rolls_the_round() {
     let (env, client, _admin, _id) = setup();
-    client.set_milestone_threshold(&3u32);
 
     let v1 = register_validator(&env, &client);
+    let _v2 = register_validator(&env, &client);
+    let _v3 = register_validator(&env, &client);
+    client.set_milestone_threshold(&3u32);
     let player_id = 42u64;
     let description = String::from_str(&env, "identity confirmed by academy");
     let evidence = cid(&env, 200);
@@ -268,9 +273,9 @@ fn pending_vote_cap_does_not_double_count_a_validators_own_self_triggered_expiry
     // threshold=2 so a lone vote never auto-commits (which would remove the
     // claim and short-circuit the scenario) — every claim in this test stays
     // open on exactly one vote from `target`.
-    client.set_milestone_threshold(&2u32);
-
     let target = register_validator(&env, &client);
+    let _extra = register_validator(&env, &client);
+    client.set_milestone_threshold(&2u32);
 
     // Open 24 distinct claims with exactly one vote each from `target`. This
     // is the maximum that can be legitimately open while still leaving room

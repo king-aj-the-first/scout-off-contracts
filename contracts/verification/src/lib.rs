@@ -19,9 +19,9 @@ pub use errors::VerificationError;
 pub use types::{
     AttestationStatus, ContractHealth, DataKey, DisputeVote, DiversityConfig, GlobalMilestoneEntry,
     GlobalMilestoneIndexPage, JuryConfig, Milestone, MilestoneAttestation, MilestoneDispute,
-    MilestoneRef, MilestoneRefPage, MilestoneWithValidatorStatus, PendingMilestoneClaim,
-    PendingVoteRef, RevocationRecord, RevocationSeverity, Validator, ValidatorActivityReport,
-    ValidatorPlayersPage, ValidatorStatus, VerificationWiringState,
+    MilestoneRef, MilestoneRefPage, MilestoneThresholdStatus, MilestoneWithValidatorStatus,
+    PendingMilestoneClaim, PendingVoteRef, RevocationRecord, RevocationSeverity, Validator,
+    ValidatorActivityReport, ValidatorPlayersPage, ValidatorStatus, VerificationWiringState,
 };
 
 use soroban_sdk::xdr::ToXdr;
@@ -127,6 +127,13 @@ const MIN_VOTING_WINDOW_SECS: u64 = 3_600;
 /// Ceiling for admin-configured voting windows (90 days) — bounds how long a
 /// sub-threshold claim's fixed-size storage entry can sit unresolved.
 const MAX_VOTING_WINDOW_SECS: u64 = 7_776_000;
+
+/// Floor for jury voting windows (1 day). Mirrors the attestation floor
+/// intent: a zero / near-zero window lets disputes be tallied before anyone
+/// can vote (issue #1394).
+const MIN_JURY_WINDOW_SECS: u64 = 86_400;
+/// Ceiling for jury voting windows (30 days).
+const MAX_JURY_WINDOW_SECS: u64 = 2_592_000;
 
 /// Hard cap on how many distinct sub-threshold claims a single validator may
 /// have an open vote on at once. Bounds `DataKey::ValidatorPendingVotes` to a
@@ -417,25 +424,37 @@ impl VerificationContract {
     /// Set the k-of-n distinct-active-validator threshold required before a
     /// claim accumulated via `attest_milestone` is committed (admin only).
     ///
-    /// Must be in `[1, MAX_VALIDATORS]`. `1` reduces to today's
-    /// single-signature model — see `DEFAULT_MILESTONE_THRESHOLD` for why
-    /// that default exists and why it is not a silent bypass. Raising this
-    /// to `>= 2` is what actually closes the single-compromised-validator
-    /// gap this mechanism exists for.
+    /// Must be in `[1, MAX_VALIDATORS]` and `<= ActiveValidatorCount`. `1`
+    /// reduces to today's single-signature model — see
+    /// `DEFAULT_MILESTONE_THRESHOLD` for why that default exists and why it
+    /// is not a silent bypass. Raising this to `>= 2` is what actually
+    /// closes the single-compromised-validator gap this mechanism exists for.
     ///
     /// Already-open claims keep the threshold that was in effect when their
     /// current voting round started (`PendingMilestoneClaim::threshold`) —
     /// changing this value only affects claims that start a fresh round
     /// afterward, so an admin cannot retroactively fast-track or invalidate
-    /// an in-flight claim by moving the threshold mid-vote.
+    /// an in-flight claim by moving the threshold mid-vote. Lowering the
+    /// global threshold likewise does **not** rescue already-stuck claims
+    /// that snapshotted a higher value.
     pub fn set_milestone_threshold(env: Env, threshold: u32) -> Result<(), VerificationError> {
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         if threshold == 0 || threshold > MAX_VALIDATORS {
             return Err(VerificationError::InvalidInput);
         }
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveValidatorCount)
+            .unwrap_or(0u32);
+        if threshold > active_count {
+            return Err(VerificationError::ThresholdExceedsActiveValidators);
+        }
+        let old = Self::get_milestone_threshold(env.clone());
         env.storage()
             .instance()
             .set(&DataKey::MilestoneApprovalThreshold, &threshold);
+        events::milestone_threshold_updated(&env, &admin, old, threshold);
         Ok(())
     }
 
@@ -446,6 +465,22 @@ impl VerificationContract {
             .instance()
             .get::<DataKey, u32>(&DataKey::MilestoneApprovalThreshold)
             .unwrap_or(DEFAULT_MILESTONE_THRESHOLD)
+    }
+
+    /// Monitoring helper: current milestone threshold vs active validator
+    /// count, plus whether new claims are reachable (`active >= threshold`).
+    pub fn get_milestone_threshold_status(env: Env) -> MilestoneThresholdStatus {
+        let threshold = Self::get_milestone_threshold(env.clone());
+        let active_validator_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveValidatorCount)
+            .unwrap_or(0u32);
+        MilestoneThresholdStatus {
+            threshold,
+            active_validator_count,
+            reachable: active_validator_count >= threshold,
+        }
     }
 
     /// Set the attestation voting window in seconds (admin only). Must be in
@@ -486,35 +521,14 @@ impl VerificationContract {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
 
-        // Per-wallet cooldown: reject rapid re-registration attempts of the
-        // same wallet. Mirrors register_player/register_scout in the
-        // registration contract.
-        Self::enforce_reg_cooldown(&env, &DataKey::ValidatorRegLastSent(wallet.clone()))?;
+        Self::validate_validator_input(
+            &env,
+            &wallet,
+            &credentials,
+            &affiliation,
+            &specializations,
+        )?;
 
-        if credentials.len() > MAX_CREDENTIALS_LEN {
-            return Err(VerificationError::InvalidInput);
-        }
-
-        if credentials.len() < MIN_CREDENTIALS_LEN {
-            return Err(VerificationError::InvalidInput);
-        }
-
-        if affiliation.len() > MAX_CREDENTIALS_LEN {
-            return Err(VerificationError::InvalidInput);
-        }
-
-        // Validate specializations: cap count and tag length
-        if specializations.len() > MAX_SPECIALIZATIONS {
-            return Err(VerificationError::InvalidInput);
-        }
-        for i in 0..specializations.len() {
-            let tag = specializations.get(i).unwrap();
-            if tag.is_empty() || tag.len() > MAX_SPECIALIZATION_TAG_LEN {
-                return Err(VerificationError::InvalidInput);
-            }
-        }
-
-        // Check if we've reached the maximum number of validators
         let total_count: u32 = env
             .storage()
             .instance()
@@ -530,39 +544,18 @@ impl VerificationContract {
             .get(&DataKey::ValidatorVector)
             .unwrap_or_else(|| Vec::new(&env));
 
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Validator(wallet.clone()))
-        {
-            return Err(VerificationError::ValidatorAlreadyRegistered);
-        }
-
-        let validator = Validator {
-            wallet: wallet.clone(),
+        Self::write_validator(
+            &env,
+            wallet,
             credentials,
             affiliation,
-            registered_at: env.ledger().timestamp(),
-            active: true,
             specializations,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Validator(wallet.clone()), &validator);
-        // Keep-alive: extend TTL for validator records to preserve their identity
-        // and active/revoked status over time.
-        env.storage().persistent().extend_ttl(
-            &DataKey::Validator(wallet.clone()),
-            PERSISTENT_TTL_MIN,
-            PERSISTENT_TTL_MAX,
-        );
+            &mut validator_vector,
+        )?;
 
-        validator_vector.push_back(wallet.clone());
         env.storage()
             .persistent()
             .set(&DataKey::ValidatorVector, &validator_vector);
-        // Keep-alive: extend TTL for the validator vector itself so the registry
-        // remains discoverable.
         env.storage().persistent().extend_ttl(
             &DataKey::ValidatorVector,
             PERSISTENT_TTL_MIN,
@@ -578,28 +571,9 @@ impl VerificationContract {
             &DataKey::ActiveValidatorCount,
             &safe_add_u32(active_count, 1).map_err(|_| VerificationError::Overflow)?,
         );
-
-        let total_count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::TotalValidatorCount)
-            .unwrap_or(0u32);
         env.storage().instance().set(
             &DataKey::TotalValidatorCount,
             &safe_add_u32(total_count, 1).map_err(|_| VerificationError::Overflow)?,
-        );
-
-        events::validator_registered(&env, &wallet, &validator.credentials);
-
-        // Record cooldown timestamp for future re-registration attempts.
-        let now = env.ledger().timestamp();
-        env.storage()
-            .persistent()
-            .set(&DataKey::ValidatorRegLastSent(wallet.clone()), &now);
-        env.storage().persistent().extend_ttl(
-            &DataKey::ValidatorRegLastSent(wallet.clone()),
-            PERSISTENT_TTL_MIN,
-            PERSISTENT_TTL_MAX,
         );
 
         Ok(())
@@ -650,6 +624,13 @@ impl VerificationContract {
     ///   first batch and stores a cursor; call `continue_revocation_cascade` to
     ///   finish.
     ///
+    /// Re-revocation rules (issue #1393):
+    /// - Same severity again → `ValidatorAlreadyRevoked`.
+    /// - ForCause → Routine (downgrade) → `ValidatorAlreadyRevoked`.
+    /// - Routine → ForCause (escalation) → allowed; original record is pushed to
+    ///   `RevocationHistory`, `revoked_at` is preserved, and any in-progress
+    ///   cascade cursor is **not** reset to 0.
+    ///
     /// Optionally accepts a reason (max 128 bytes) included in the event and
     /// stored in the `RevocationRecord`.
     pub fn revoke_validator(
@@ -666,87 +647,8 @@ impl VerificationContract {
             }
         }
 
-        let mut validator: Validator = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Validator(wallet.clone()))
-            .ok_or(VerificationError::ValidatorNotFound)?;
-        let was_active = validator.active;
-        validator.active = false;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Validator(wallet.clone()), &validator);
-
-        if was_active {
-            let count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::ActiveValidatorCount)
-                .unwrap_or(0u32);
-            env.storage().instance().set(
-                &DataKey::ActiveValidatorCount,
-                &safe_sub_u32(count, 1).map_err(|_| VerificationError::Overflow)?,
-            );
-        }
-
-        let validator_vector: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ValidatorVector)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut new_vector: Vec<Address> = Vec::new(&env);
-        for i in 0..validator_vector.len() {
-            let addr = validator_vector.get(i).unwrap();
-            if addr != wallet {
-                new_vector.push_back(addr);
-            }
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::ValidatorVector, &new_vector);
-
-        // Retroactively invalidate this validator's contribution to every
-        // still-open (sub-threshold) pending attestation claim.
-        let invalidated = Self::invalidate_pending_votes_for_validator(&env, &wallet);
-        if invalidated > 0 {
-            events::validator_pending_votes_invalidated(&env, &admin, &wallet, invalidated);
-        }
-
         let reason_str = reason.unwrap_or(String::from_str(&env, ""));
-
-        // Persist a RevocationRecord for audit purposes.
-        let record = RevocationRecord {
-            severity: severity.clone(),
-            reason: reason_str.clone(),
-            revoked_at: env.ledger().timestamp(),
-            admin: admin.clone(),
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::RevocationRecord(wallet.clone()), &record);
-        env.storage().persistent().extend_ttl(
-            &DataKey::RevocationRecord(wallet.clone()),
-            PERSISTENT_TTL_MIN,
-            PERSISTENT_TTL_MAX,
-        );
-
-        // Emit the appropriate revocation event.
-        match severity {
-            RevocationSeverity::Routine => {
-                events::validator_revoked(&env, &admin, &wallet, &reason_str);
-            }
-            RevocationSeverity::ForCause => {
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
-                events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                events::validator_revoked_for_cause(&env, &admin, &wallet, &reason_str);
-                // Start (or complete) the bounded cascade sweep.
-                Self::run_cascade_sweep(&env, &wallet, 0)?;
-            }
-        }
-
-        Ok(())
+        Self::revoke_validator_internal(&env, &admin, wallet, severity, reason_str)
     }
 
     /// Continue a for-cause revocation cascade sweep that was interrupted
@@ -954,67 +856,13 @@ impl VerificationContract {
 
         for i in 0..wallets.len() {
             let wallet = wallets.get(i).unwrap();
-
-            let mut validator: Validator = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Validator(wallet.clone()))
-                .ok_or(VerificationError::ValidatorNotFound)?;
-            validator.active = false;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Validator(wallet.clone()), &validator);
-
-            let validator_vector: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ValidatorVector)
-                .unwrap_or_else(|| Vec::new(&env));
-            let mut new_vector: Vec<Address> = Vec::new(&env);
-            for j in 0..validator_vector.len() {
-                let addr = validator_vector.get(j).unwrap();
-                if addr != wallet {
-                    new_vector.push_back(addr);
-                }
-            }
-            env.storage()
-                .persistent()
-                .set(&DataKey::ValidatorVector, &new_vector);
-
-            let invalidated = Self::invalidate_pending_votes_for_validator(&env, &wallet);
-            if invalidated > 0 {
-                events::validator_pending_votes_invalidated(&env, &admin, &wallet, invalidated);
-            }
-
-            // Persist a RevocationRecord for each wallet.
-            let record = RevocationRecord {
-                severity: severity.clone(),
-                reason: reason_str.clone(),
-                revoked_at: env.ledger().timestamp(),
-                admin: admin.clone(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::RevocationRecord(wallet.clone()), &record);
-            env.storage().persistent().extend_ttl(
-                &DataKey::RevocationRecord(wallet.clone()),
-                PERSISTENT_TTL_MIN,
-                PERSISTENT_TTL_MAX,
-            );
-
-            match severity {
-                RevocationSeverity::Routine => {
-                    events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                }
-                RevocationSeverity::ForCause => {
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
-                    events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                    events::validator_revoked_for_cause(&env, &admin, &wallet, &reason_str);
-                    Self::run_cascade_sweep(&env, &wallet, 0)?;
-                }
-            }
+            Self::revoke_validator_internal(
+                &env,
+                &admin,
+                wallet,
+                severity.clone(),
+                reason_str.clone(),
+            )?;
         }
 
         Ok(())
@@ -1050,28 +898,13 @@ impl VerificationContract {
         for i in 0..entries.len() {
             let (wallet, credentials, affiliation, specializations) = entries.get(i).unwrap();
 
-            // Per-wallet cooldown, same as register_validator.
-            Self::enforce_reg_cooldown(&env, &DataKey::ValidatorRegLastSent(wallet.clone()))?;
-
-            if affiliation.len() > MAX_CREDENTIALS_LEN {
-                return Err(VerificationError::InvalidInput);
-            }
-
-            // Length checks.
-            if credentials.len() > MAX_CREDENTIALS_LEN || credentials.len() < MIN_CREDENTIALS_LEN {
-                return Err(VerificationError::InvalidInput);
-            }
-
-            // Specialization checks.
-            if specializations.len() > MAX_SPECIALIZATIONS {
-                return Err(VerificationError::InvalidInput);
-            }
-            for k in 0..specializations.len() {
-                let tag = specializations.get(k).unwrap();
-                if tag.is_empty() || tag.len() > MAX_SPECIALIZATION_TAG_LEN {
-                    return Err(VerificationError::InvalidInput);
-                }
-            }
+            Self::validate_validator_input(
+                &env,
+                &wallet,
+                &credentials,
+                &affiliation,
+                &specializations,
+            )?;
 
             // Duplicate within the batch.
             for j in 0..i {
@@ -1079,15 +912,6 @@ impl VerificationContract {
                 if other_wallet == wallet {
                     return Err(VerificationError::ValidatorAlreadyRegistered);
                 }
-            }
-
-            // Duplicate in existing registry.
-            if env
-                .storage()
-                .persistent()
-                .has(&DataKey::Validator(wallet.clone()))
-            {
-                return Err(VerificationError::ValidatorAlreadyRegistered);
             }
         }
 
@@ -1100,58 +924,35 @@ impl VerificationContract {
 
         for i in 0..entries.len() {
             let (wallet, credentials, affiliation, specializations) = entries.get(i).unwrap();
-            if affiliation.len() > MAX_CREDENTIALS_LEN {
-                return Err(VerificationError::InvalidInput);
-            }
-            let validator = Validator {
-                wallet: wallet.clone(),
-                credentials: credentials.clone(),
-                affiliation: affiliation.clone(),
-                registered_at: env.ledger().timestamp(),
-                active: true,
-                specializations: specializations.clone(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::Validator(wallet.clone()), &validator);
-            // Keep-alive: extend TTL for validator records.
-            env.storage().persistent().extend_ttl(
-                &DataKey::Validator(wallet.clone()),
-                PERSISTENT_TTL_MIN,
-                PERSISTENT_TTL_MAX,
-            );
-            validator_vector.push_back(wallet.clone());
-
-            // Increment active validator count.
-            let active_count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::ActiveValidatorCount)
-                .unwrap_or(0u32);
-            env.storage().instance().set(
-                &DataKey::ActiveValidatorCount,
-                &safe_add_u32(active_count, 1).map_err(|_| VerificationError::Overflow)?,
-            );
-
-            // Increment total validator count.
-            let total_count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TotalValidatorCount)
-                .unwrap_or(0u32);
-            env.storage().instance().set(
-                &DataKey::TotalValidatorCount,
-                &safe_add_u32(total_count, 1).map_err(|_| VerificationError::Overflow)?,
-            );
-
-            events::validator_registered(&env, &wallet, &validator.credentials);
+            Self::write_validator(
+                &env,
+                wallet,
+                credentials,
+                affiliation,
+                specializations,
+                &mut validator_vector,
+            )?;
         }
+
+        // Counters once per batch (not once per entry).
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveValidatorCount)
+            .unwrap_or(0u32);
+        env.storage().instance().set(
+            &DataKey::ActiveValidatorCount,
+            &safe_add_u32(active_count, batch_len).map_err(|_| VerificationError::Overflow)?,
+        );
+        env.storage().instance().set(
+            &DataKey::TotalValidatorCount,
+            &safe_add_u32(current_count, batch_len).map_err(|_| VerificationError::Overflow)?,
+        );
 
         // Persist updated vector.
         env.storage()
             .persistent()
             .set(&DataKey::ValidatorVector, &validator_vector);
-        // Keep-alive: extend TTL for the validator vector.
         env.storage().persistent().extend_ttl(
             &DataKey::ValidatorVector,
             PERSISTENT_TTL_MIN,
@@ -3191,14 +2992,18 @@ impl VerificationContract {
     /// Configure the jury escalation parameters (admin only).
     ///
     /// - `impact_threshold`: disputes with `impact_score >= threshold` are jury-routed.
-    ///   Default: 100.
+    ///   Default: 100. Any `u32` is accepted.
     /// - `quorum`: minimum distinct validator votes required for a jury outcome.
-    ///   Default: 3.
+    ///   Must satisfy `1 <= quorum <= MAX_VALIDATORS` and
+    ///   `quorum <= ActiveValidatorCount`. Default: 3.
     /// - `voting_window_secs`: seconds after filing before the voting window closes.
-    ///   Default: 604800 (7 days).
+    ///   Must be in `[MIN_JURY_WINDOW_SECS, MAX_JURY_WINDOW_SECS]`
+    ///   (1 day – 30 days). Default: 604800 (7 days).
     ///
     /// This only affects disputes filed *after* this call — in-flight disputes
     /// snapshot the parameters at filing time.
+    ///
+    /// Emits `jury_config_updated` on success.
     pub fn set_jury_config(
         env: Env,
         impact_threshold: u32,
@@ -3208,14 +3013,40 @@ impl VerificationContract {
         Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
 
+        if quorum < 1 || quorum > MAX_VALIDATORS {
+            return Err(VerificationError::InvalidInput);
+        }
+        let active_count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveValidatorCount)
+            .unwrap_or(0u32);
+        if quorum > active_count {
+            return Err(VerificationError::InvalidInput);
+        }
+        if !(MIN_JURY_WINDOW_SECS..=MAX_JURY_WINDOW_SECS).contains(&voting_window_secs) {
+            return Err(VerificationError::InvalidInput);
+        }
+
+        let old = Self::get_jury_config_internal(&env);
         let config = JuryConfig {
             impact_threshold,
             quorum,
             voting_window_secs,
         };
         env.storage().instance().set(&DataKey::JuryConfig, &config);
+        events::jury_config_updated(
+            &env,
+            &admin,
+            old.impact_threshold,
+            old.quorum,
+            old.voting_window_secs,
+            impact_threshold,
+            quorum,
+            voting_window_secs,
+        );
         Ok(())
     }
 
@@ -3646,6 +3477,16 @@ impl VerificationContract {
             .get(&DataKey::RevocationRecord(wallet))
     }
 
+    /// Return prior revocation records preserved when a Routine revocation
+    /// was escalated to ForCause (issue #1393). Empty if no escalation has
+    /// occurred for this wallet.
+    pub fn get_revocation_history(env: Env, wallet: Address) -> Vec<RevocationRecord> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RevocationHistory(wallet))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// Returns the total number of disputes filed for a given `player_id`.
     pub fn get_player_dispute_count(env: Env, player_id: u64) -> u32 {
         let disputes_key = DataKey::PlayerDisputes(player_id);
@@ -3829,6 +3670,251 @@ impl VerificationContract {
             }
         }
         Ok(())
+    }
+
+    /// Shared input validation for `register_validator` / `batch_register_validators`.
+    fn validate_validator_input(
+        env: &Env,
+        wallet: &Address,
+        credentials: &String,
+        affiliation: &String,
+        specializations: &Vec<String>,
+    ) -> Result<(), VerificationError> {
+        Self::enforce_reg_cooldown(env, &DataKey::ValidatorRegLastSent(wallet.clone()))?;
+
+        if credentials.len() > MAX_CREDENTIALS_LEN || credentials.len() < MIN_CREDENTIALS_LEN {
+            return Err(VerificationError::InvalidInput);
+        }
+        if affiliation.len() > MAX_CREDENTIALS_LEN {
+            return Err(VerificationError::InvalidInput);
+        }
+        if specializations.len() > MAX_SPECIALIZATIONS {
+            return Err(VerificationError::InvalidInput);
+        }
+        for i in 0..specializations.len() {
+            let tag = specializations.get(i).unwrap();
+            if tag.is_empty() || tag.len() > MAX_SPECIALIZATION_TAG_LEN {
+                return Err(VerificationError::InvalidInput);
+            }
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Validator(wallet.clone()))
+        {
+            return Err(VerificationError::ValidatorAlreadyRegistered);
+        }
+        Ok(())
+    }
+
+    /// Persist a newly registered validator (record, vector entry, cooldown,
+    /// event). Callers own counter updates so batch registration can bump
+    /// once per batch.
+    fn write_validator(
+        env: &Env,
+        wallet: Address,
+        credentials: String,
+        affiliation: String,
+        specializations: Vec<String>,
+        validator_vector: &mut Vec<Address>,
+    ) -> Result<(), VerificationError> {
+        let validator = Validator {
+            wallet: wallet.clone(),
+            credentials: credentials.clone(),
+            affiliation,
+            registered_at: env.ledger().timestamp(),
+            active: true,
+            specializations,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Validator(wallet.clone()), &validator);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Validator(wallet.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
+        validator_vector.push_back(wallet.clone());
+
+        let now = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorRegLastSent(wallet.clone()), &now);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ValidatorRegLastSent(wallet.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
+        events::validator_registered(env, &wallet, &credentials);
+        Ok(())
+    }
+
+    /// Shared revoke path for `revoke_validator` / `batch_revoke_validators`.
+    fn revoke_validator_internal(
+        env: &Env,
+        admin: &Address,
+        wallet: Address,
+        severity: RevocationSeverity,
+        reason_str: String,
+    ) -> Result<(), VerificationError> {
+        let mut validator: Validator = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Validator(wallet.clone()))
+            .ok_or(VerificationError::ValidatorNotFound)?;
+
+        if !validator.active {
+            return Self::handle_inactive_re_revoke(env, admin, &wallet, severity, reason_str);
+        }
+
+        validator.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Validator(wallet.clone()), &validator);
+
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveValidatorCount)
+            .unwrap_or(0u32);
+        let new_count = safe_sub_u32(count, 1).map_err(|_| VerificationError::Overflow)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveValidatorCount, &new_count);
+
+        let validator_vector: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorVector)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_vector: Vec<Address> = Vec::new(env);
+        for i in 0..validator_vector.len() {
+            let addr = validator_vector.get(i).unwrap();
+            if addr != wallet {
+                new_vector.push_back(addr);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorVector, &new_vector);
+
+        let invalidated = Self::invalidate_pending_votes_for_validator(env, &wallet);
+        if invalidated > 0 {
+            events::validator_pending_votes_invalidated(env, admin, &wallet, invalidated);
+        }
+
+        let record = RevocationRecord {
+            severity: severity.clone(),
+            reason: reason_str.clone(),
+            revoked_at: env.ledger().timestamp(),
+            admin: admin.clone(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::RevocationRecord(wallet.clone()), &record);
+        env.storage().persistent().extend_ttl(
+            &DataKey::RevocationRecord(wallet.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
+        match severity {
+            RevocationSeverity::Routine => {
+                events::validator_revoked(env, admin, &wallet, &reason_str);
+            }
+            RevocationSeverity::ForCause => {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
+                events::validator_revoked(env, admin, &wallet, &reason_str);
+                events::validator_revoked_for_cause(env, admin, &wallet, &reason_str);
+                Self::run_cascade_sweep(env, &wallet, 0)?;
+            }
+        }
+
+        let threshold = Self::get_milestone_threshold(env.clone());
+        if new_count < threshold {
+            events::milestone_threshold_unreachable(env, admin, threshold, new_count);
+        }
+
+        Ok(())
+    }
+
+    /// Handle revoke of an already-inactive validator (issue #1393).
+    fn handle_inactive_re_revoke(
+        env: &Env,
+        admin: &Address,
+        wallet: &Address,
+        severity: RevocationSeverity,
+        reason_str: String,
+    ) -> Result<(), VerificationError> {
+        let existing: Option<RevocationRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RevocationRecord(wallet.clone()));
+
+        let Some(existing) = existing else {
+            return Err(VerificationError::ValidatorAlreadyRevoked);
+        };
+
+        match (&existing.severity, &severity) {
+            // Same severity or ForCause → Routine downgrade: rejected.
+            (RevocationSeverity::Routine, RevocationSeverity::Routine)
+            | (RevocationSeverity::ForCause, RevocationSeverity::ForCause)
+            | (RevocationSeverity::ForCause, RevocationSeverity::Routine) => {
+                Err(VerificationError::ValidatorAlreadyRevoked)
+            }
+            // Routine → ForCause escalation: preserve original record, start cascade.
+            (RevocationSeverity::Routine, RevocationSeverity::ForCause) => {
+                let mut history: Vec<RevocationRecord> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::RevocationHistory(wallet.clone()))
+                    .unwrap_or_else(|| Vec::new(env));
+                history.push_back(existing.clone());
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::RevocationHistory(wallet.clone()), &history);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::RevocationHistory(wallet.clone()),
+                    PERSISTENT_TTL_MIN,
+                    PERSISTENT_TTL_MAX,
+                );
+
+                let escalated = RevocationRecord {
+                    severity: RevocationSeverity::ForCause,
+                    reason: reason_str.clone(),
+                    // Preserve the original revocation timestamp.
+                    revoked_at: existing.revoked_at,
+                    admin: admin.clone(),
+                };
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::RevocationRecord(wallet.clone()), &escalated);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::RevocationRecord(wallet.clone()),
+                    PERSISTENT_TTL_MIN,
+                    PERSISTENT_TTL_MAX,
+                );
+
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
+                events::validator_revoked(env, admin, wallet, &reason_str);
+                events::validator_revoked_for_cause(env, admin, wallet, &reason_str);
+
+                // Never reset an in-progress cascade cursor to 0.
+                let start: u32 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::RevocationCascadeCursor(wallet.clone()))
+                    .unwrap_or(0);
+                Self::run_cascade_sweep(env, wallet, start)?;
+                Ok(())
+            }
+        }
     }
 
     /// Check that approve_milestone is not paused (function-scoped circuit breaker).

@@ -150,6 +150,18 @@ pub enum VerificationError {
     /// `tally_dispute` called before the voting window closes and the
     /// required quorum of votes has not yet been reached.
     QuorumNotReached = 43,
+
+    // ── Revocation re-entry (issue #1393) ──
+    /// `revoke_validator` / `batch_revoke_validators` targeted a wallet that
+    /// is already inactive, and the requested severity is not a permitted
+    /// Routine → ForCause escalation.
+    ValidatorAlreadyRevoked = 44,
+
+    // ── Milestone threshold vs active set (issue #1395) ──
+    /// `set_milestone_threshold` requested a k-of-n value greater than the
+    /// current `ActiveValidatorCount`, which would make every claim
+    /// unreachable.
+    ThresholdExceedsActiveValidators = 45,
 }
 
 impl AdminError for VerificationError {

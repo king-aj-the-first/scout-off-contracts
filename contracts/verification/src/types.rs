@@ -309,7 +309,7 @@ pub enum RevocationSeverity {
 /// Retains the severity, human-readable reason, ledger timestamp, and the
 /// admin address that performed the revocation for audit purposes.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RevocationRecord {
     /// Severity of this revocation.
     pub severity: RevocationSeverity,
@@ -319,6 +319,19 @@ pub struct RevocationRecord {
     pub revoked_at: u64,
     /// Admin address that performed the revocation.
     pub admin: Address,
+}
+
+/// Operator-facing snapshot of whether the configured k-of-n milestone
+/// threshold is reachable given the current active validator set.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilestoneThresholdStatus {
+    /// Current global milestone approval threshold.
+    pub threshold: u32,
+    /// Current `ActiveValidatorCount`.
+    pub active_validator_count: u32,
+    /// `true` iff `active_validator_count >= threshold`.
+    pub reachable: bool,
 }
 
 #[contracttype]
@@ -482,6 +495,11 @@ pub enum DataKey {
     /// from which the next `continue_revocation_cascade` call should resume.
     /// Absent when no cascade is in progress or when the sweep is complete.
     RevocationCascadeCursor(Address),
+    /// Prior `RevocationRecord` entries preserved when a Routine revocation
+    /// is escalated to ForCause (issue #1393). The current record remains
+    /// under `RevocationRecord(wallet)`; this list holds superseded ones so
+    /// the original reason/timestamp are never silently lost.
+    RevocationHistory(Address),
 }
 
 /// Snapshot of both cross-contract peer address pointers held by the

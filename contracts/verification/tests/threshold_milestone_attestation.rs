@@ -120,11 +120,11 @@ fn attest_as(
 #[test]
 fn sub_threshold_votes_do_not_commit_threshold_vote_commits_once() {
     let (env, client, _admin) = setup();
-    client.set_milestone_threshold(&3u32);
 
     let v1 = register_validator(&env, &client);
     let v2 = register_validator(&env, &client);
     let v3 = register_validator(&env, &client);
+    client.set_milestone_threshold(&3u32);
     let player_id = 1u64;
     let description = String::from_str(&env, "hat-trick in regional final");
     let evidence = cid(&env, 1);
@@ -171,9 +171,10 @@ fn sub_threshold_votes_do_not_commit_threshold_vote_commits_once() {
 #[test]
 fn duplicate_attestation_is_rejected_distinctly_from_a_first_time_vote() {
     let (env, client, _admin) = setup();
-    client.set_milestone_threshold(&2u32);
 
     let v1 = register_validator(&env, &client);
+    let _v2 = register_validator(&env, &client);
+    client.set_milestone_threshold(&2u32);
     let player_id = 2u64;
     let description = String::from_str(&env, "top speed 32km/h");
     let evidence = cid(&env, 2);
@@ -199,12 +200,12 @@ fn duplicate_attestation_is_rejected_distinctly_from_a_first_time_vote() {
 #[test]
 fn revoke_validator_retroactively_invalidates_a_pending_vote() {
     let (env, client, _admin) = setup();
-    client.set_milestone_threshold(&3u32);
 
     let v1 = register_validator(&env, &client);
     let v2 = register_validator(&env, &client);
     let v3 = register_validator(&env, &client);
     let v4 = register_validator(&env, &client);
+    client.set_milestone_threshold(&3u32);
     let player_id = 3u64;
     let description = String::from_str(&env, "identity confirmed by academy");
     let evidence = cid(&env, 3);
@@ -257,11 +258,11 @@ fn revoke_validator_retroactively_invalidates_a_pending_vote() {
 #[test]
 fn voting_window_expiry_resets_the_tally_instead_of_leaking_storage() {
     let (env, client, _admin) = setup();
-    client.set_milestone_threshold(&3u32);
 
     let v1 = register_validator(&env, &client);
     let v2 = register_validator(&env, &client);
     let v3 = register_validator(&env, &client);
+    client.set_milestone_threshold(&3u32);
     let player_id = 4u64;
     let description = String::from_str(&env, "academy membership verified");
     let evidence = cid(&env, 4);
@@ -336,9 +337,10 @@ fn approve_milestone_still_works_at_default_threshold_one() {
 #[test]
 fn approve_milestone_is_closed_once_threshold_mode_is_configured() {
     let (env, client, _admin) = setup();
-    client.set_milestone_threshold(&2u32);
 
     let validator = register_validator(&env, &client);
+    let _extra = register_validator(&env, &client);
+    client.set_milestone_threshold(&2u32);
     let result = client.try_approve_milestone(
         &validator,
         &6u64,
@@ -373,11 +375,11 @@ fn approve_milestone_is_closed_once_threshold_mode_is_configured() {
 /// this helper is the number of distinct validators registered and voting.
 fn measure_threshold_reach_cpu(threshold: u32) -> u64 {
     let (env, client, _admin) = setup();
-    client.set_milestone_threshold(&threshold);
 
     let validators: std::vec::Vec<Address> = (0..threshold)
         .map(|_| register_validator(&env, &client))
         .collect();
+    client.set_milestone_threshold(&threshold);
     let player_id = 1u64;
     let description = String::from_str(&env, "threshold-scaling scenario");
     let evidence = cid(&env, 1);

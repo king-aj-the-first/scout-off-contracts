@@ -22,6 +22,9 @@ pub const VALIDATOR_PENDING_VOTES_INVALIDATED: &str = "validator_votes_invalidat
 pub const WIRING_UPDATED: &str = "wiring_updated";
 pub const DISPUTE_VOTE_CAST: &str = "dispute_vote_cast";
 pub const DISPUTE_TALLIED: &str = "dispute_tallied";
+pub const JURY_CONFIG_UPDATED: &str = "jury_config_updated";
+pub const MILESTONE_THRESHOLD_UPDATED: &str = "milestone_threshold_updated";
+pub const MILESTONE_THRESHOLD_UNREACHABLE: &str = "milestone_threshold_unreachable";
 
 /// topics: (event_name, old_admin)  data: new_admin
 pub fn admin_transfer_proposed(env: &Env, old_admin: &Address, new_admin: &Address) {
@@ -404,5 +407,57 @@ pub fn dispute_tallied(
     env.events().publish(
         (Symbol::new(env, DISPUTE_TALLIED), player_id),
         (milestone_index, upheld, votes_for, votes_against),
+    );
+}
+
+/// Emitted when an admin updates jury escalation parameters via `set_jury_config`.
+/// topics: (event_name, admin)  data: (old_impact, old_quorum, old_window, new_impact, new_quorum, new_window)
+pub fn jury_config_updated(
+    env: &Env,
+    admin: &Address,
+    old_impact: u32,
+    old_quorum: u32,
+    old_window: u64,
+    new_impact: u32,
+    new_quorum: u32,
+    new_window: u64,
+) {
+    env.events().publish(
+        (Symbol::new(env, JURY_CONFIG_UPDATED), admin.clone()),
+        (
+            old_impact,
+            old_quorum,
+            old_window,
+            new_impact,
+            new_quorum,
+            new_window,
+        ),
+    );
+}
+
+/// Emitted when an admin changes the k-of-n milestone approval threshold.
+/// topics: (event_name, admin)  data: (old_threshold, new_threshold)
+pub fn milestone_threshold_updated(env: &Env, admin: &Address, old: u32, new: u32) {
+    env.events().publish(
+        (Symbol::new(env, MILESTONE_THRESHOLD_UPDATED), admin.clone()),
+        (old, new),
+    );
+}
+
+/// Emitted when a validator revocation leaves `ActiveValidatorCount` below
+/// the configured milestone threshold, making new claims unreachable.
+/// topics: (event_name, admin)  data: (threshold, active_validator_count)
+pub fn milestone_threshold_unreachable(
+    env: &Env,
+    admin: &Address,
+    threshold: u32,
+    active_validator_count: u32,
+) {
+    env.events().publish(
+        (
+            Symbol::new(env, MILESTONE_THRESHOLD_UNREACHABLE),
+            admin.clone(),
+        ),
+        (threshold, active_validator_count),
     );
 }

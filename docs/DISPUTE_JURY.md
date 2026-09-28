@@ -40,12 +40,14 @@ The dispute filer is not restricted unless they are also the original approver (
 
 ## Quorum and voting window
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `quorum` | 3 | Minimum votes before a jury outcome can be recorded |
-| `voting_window_secs` | 604800 (7 days) | Seconds after filing when voting closes |
+| Parameter | Default | Bounds | Description |
+|-----------|---------|--------|-------------|
+| `quorum` | 3 | `1..=MAX_VALIDATORS` and `<= ActiveValidatorCount` | Minimum votes before a jury outcome can be recorded |
+| `voting_window_secs` | 604800 (7 days) | `MIN_JURY_WINDOW_SECS` (86400 / 1 day) ..= `MAX_JURY_WINDOW_SECS` (2592000 / 30 days) | Seconds after filing when voting closes |
+| `impact_threshold` | 100 | any `u32` | Disputes with `impact_score >= threshold` are jury-routed |
 
-Configurable via `set_jury_config` (admin only).
+Configurable via `set_jury_config` (admin only). Invalid bounds return `InvalidInput`.
+A successful change emits `jury_config_updated`.
 
 A dispute snapshots its quorum and voting deadline when it is filed, so later
 configuration changes cannot alter an in-progress vote.
@@ -75,6 +77,7 @@ Admin `resolve_dispute` is **blocked** for jury-required disputes (`DisputeRequi
 | `dispute_vote_cast` | Validator casts a vote |
 | `dispute_tallied` | Jury outcome finalized |
 | `dispute_resolved` | Admin resolves a low-impact dispute |
+| `jury_config_updated` | Admin changes jury parameters via `set_jury_config` |
 
 ## Storage
 

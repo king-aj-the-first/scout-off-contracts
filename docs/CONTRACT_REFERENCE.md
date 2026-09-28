@@ -970,12 +970,14 @@ Deactivate a validator. Revoked validators cannot approve milestones.
 
 `reason` is optional and capped at 128 bytes. A `RevocationRecord` (severity, reason, timestamp, admin) is persisted under `DataKey::RevocationRecord(wallet)`.
 
+**Re-revocation (issue #1393):** same-severity and ForCause→Routine calls return `ValidatorAlreadyRevoked`. Routine→ForCause escalation is allowed: the prior record is pushed to `RevocationHistory`, the original `revoked_at` is preserved, and any in-progress cascade cursor is not reset to 0. If the revocation drops `ActiveValidatorCount` below the configured milestone threshold, `milestone_threshold_unreachable` is emitted.
+
 **Breaking change (v1.0.0):** The old `reason: Option<String>` signature is replaced. The old string-equality-to-`"Routine"` severity inference is removed. All call sites must supply an explicit `severity`.
 
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `ValidatorNotFound` · `ReasonTooLong` (reason > 128 bytes) · `Unauthorized` |
+| **Errors** | `ValidatorNotFound` · `ValidatorAlreadyRevoked` · `ReasonTooLong` (reason > 128 bytes) · `Unauthorized` |
 
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
@@ -1048,6 +1050,18 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 
 ---
 
+#### `get_revocation_history(wallet: Address) -> Vec<RevocationRecord>`
+
+Return prior `RevocationRecord` entries preserved when a Routine revocation was
+escalated to ForCause. Empty if no escalation has occurred for this wallet.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
+
+---
+
 #### `batch_revoke_validators(wallets: Vec<Address>, severity: RevocationSeverity, reason: Option<String>) -> Result<(), VerificationError>`
 
 Revoke multiple validators in a single atomic transaction. Applies the same
@@ -1061,7 +1075,7 @@ For `ForCause`, each validator's cascade sweep is started inline. Use `continue_
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `ValidatorNotFound` · `ReasonTooLong` (reason > 128 bytes) · `Unauthorized` |
+| **Errors** | `ValidatorNotFound` · `ValidatorAlreadyRevoked` · `ReasonTooLong` (reason > 128 bytes) · `Unauthorized` |
 
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
@@ -1406,16 +1420,35 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 
 Configure (admin only) or read the k-of-n distinct-active-validator threshold
 required before an `attest_milestone` claim commits. Must be in
-`[1, MAX_VALIDATORS]`. Defaults to `1` — see `approve_milestone` above for why.
+`[1, MAX_VALIDATORS]` **and** `<= ActiveValidatorCount`. Defaults to `1` —
+see `approve_milestone` above for why.
 An already-open claim keeps the threshold in effect when its current round
 started; changing this value only affects claims that start a fresh round
 afterward, so the admin cannot retroactively fast-track or invalidate an
-in-flight claim by moving the threshold mid-vote.
+in-flight claim by moving the threshold mid-vote. Lowering the global
+threshold does **not** rescue stuck claims that snapshotted a higher value.
+
+Emits `milestone_threshold_updated` on success. A revocation that leaves
+`ActiveValidatorCount < threshold` emits `milestone_threshold_unreachable`
+(revocation is still allowed — operators must lower the threshold or restore
+validators).
 
 | | |
 |---|---|
 | **Auth** | admin must sign (`set_milestone_threshold` only) |
-| **Errors** | `InvalidInput` (threshold is 0 or exceeds `MAX_VALIDATORS`) |
+| **Errors** | `InvalidInput` (threshold is 0 or exceeds `MAX_VALIDATORS`) · `ThresholdExceedsActiveValidators` (threshold > active set) |
+
+---
+
+#### `get_milestone_threshold_status() -> MilestoneThresholdStatus`
+
+Monitoring helper returning `{ threshold, active_validator_count, reachable }`
+where `reachable = active_validator_count >= threshold`.
+
+| | |
+|---|---|
+| **Auth** | None |
+| **Errors** | None |
 
 ---
 
@@ -2128,18 +2161,18 @@ stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
 
 Admin-only. Configure the jury escalation parameters. Changes only affect
 disputes filed **after** this call — in-flight disputes keep their snapshotted
-values.
+values. Emits `jury_config_updated`.
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `impact_threshold` | 100 | Disputes with `impact_score >= threshold` are jury-routed |
-| `quorum` | 3 | Minimum distinct validator votes required for a jury outcome |
-| `voting_window_secs` | 604800 | Seconds after filing when the voting window closes (7 days) |
+| Parameter | Default | Bounds | Description |
+|-----------|---------|--------|-------------|
+| `impact_threshold` | 100 | any `u32` | Disputes with `impact_score >= threshold` are jury-routed |
+| `quorum` | 3 | `1..=MAX_VALIDATORS` and `<= ActiveValidatorCount` | Minimum distinct validator votes required for a jury outcome |
+| `voting_window_secs` | 604800 | `86400..=2592000` (1–30 days) | Seconds after filing when the voting window closes |
 
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `ContractPaused` · `NotInitialized` · `Unauthorized` |
+| **Errors** | `ContractPaused` · `NotInitialized` · `Unauthorized` · `InvalidInput` (bounds) |
 
 ```bash
 stellar contract invoke --id $VERIFICATION_CONTRACT_ID \
@@ -5120,6 +5153,8 @@ pub struct TrialOffer {
 | 41 | `AlreadyVoted` | `cast_dispute_vote` called by a validator who has already voted on this dispute |
 | 42 | `VotingWindowOpen` | `tally_dispute` called before the window closes with votes tied at or above quorum |
 | 43 | `QuorumNotReached` | `tally_dispute` called before the window closes and quorum not yet reached |
+| 44 | `ValidatorAlreadyRevoked` | `revoke_validator` / `batch_revoke_validators` on an inactive wallet without a permitted Routine → ForCause escalation |
+| 45 | `ThresholdExceedsActiveValidators` | `set_milestone_threshold` requested a value greater than `ActiveValidatorCount` |
 
 ### `ProgressError` (progress contract)
 
@@ -5247,6 +5282,9 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `level_advancement_skipped` | event_name, player_id (u64) | reason (String) | A milestone was recorded but the Level-2+ advance was gated (region-quorum / affiliation-diversity not met) |
 | `progress_contract_not_set` | event_name, player_id (u64) | () | Diagnostic: `approve_milestone` reached the cross-call point with no `progress_contract` wired |
 | `progress_call_failed` | event_name, player_id (u64) | error_code (u32) | Diagnostic (transaction receipt only): the cross-contract `advance_level` call returned an error, which aborts the whole transaction |
+| `jury_config_updated` | event_name, admin (Address) | old_impact (u32), old_quorum (u32), old_window (u64), new_impact (u32), new_quorum (u32), new_window (u64) | Admin updated jury escalation parameters via `set_jury_config` |
+| `milestone_threshold_updated` | event_name, admin (Address) | old_threshold (u32), new_threshold (u32) | Admin changed the k-of-n milestone approval threshold |
+| `milestone_threshold_unreachable` | event_name, admin (Address) | threshold (u32), active_validator_count (u32) | A revocation (or similar) left active validators below the configured threshold |
 
 ### progress
 
